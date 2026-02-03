@@ -1,0 +1,627 @@
+//questo codice è finito, funziona tutto il countdown rimane sullo schermo.
+
+#include <LiquidCrystal.h>
+#include <IRremote.hpp>
+
+// =====================================================
+//                    STRUTTURE DATI
+// =====================================================
+struct Puzzle {
+  const char* expr;       // testo enigma (max 16 char, senza spazi)
+  const char* solution;   // soluzione senza zeri davanti (1 o 2 cifre)
+};
+
+// =====================================================
+//                       PINOUT
+// =====================================================
+LiquidCrystal lcd(2, 3, 4, 5, 6, 7);
+const int IR_PIN = 8;
+
+const int ledPins[3] = {9, 10, 11};
+const int buzzerPin = 12;          // ACTIVE buzzer (solo ON/OFF)
+
+const int wirePins[3] = {A1, A2, A3};   // 1=ROSSO 2=BLU 3=VERDE (sx->dx)
+const int mysteryPins[2] = {A4, A5};    // bonus / trap (fase fili)
+
+// =====================================================
+//                  STATI / CONFIG GIOCO
+// =====================================================
+const int maxInputLen = 2;     // massimo 2 cifre inseribili
+int errors = 0;
+String inputCode = "";
+
+// Timer continuo
+long timeLeft = 60;
+unsigned long lastTick = 0;
+
+float speedFactor = 1.0;
+float speedStep = 0.4;
+
+bool gameActive = false;
+bool gameOver = false;
+
+enum Phase { PHASE_PUZZLE1, PHASE_PUZZLE2, PHASE_WIRE };
+Phase phase = PHASE_PUZZLE1;
+
+enum Difficulty { EASY=1, NORMAL=2, HARD=3 };
+Difficulty difficulty = NORMAL;
+
+// =====================================================
+//                      IR CODES (TUOI)
+// =====================================================
+#define IR_0    0xE916FF00
+#define IR_1    0xF30CFF00
+#define IR_2    0xE718FF00
+#define IR_3    0xA15EFF00
+#define IR_4    0xF708FF00
+#define IR_5    0xE31CFF00
+#define IR_6    0xA55AFF00
+#define IR_7    0xBD42FF00
+#define IR_8    0xAD52FF00
+#define IR_9    0xB54AFF00
+#define IR_OK   0xBF40FF00
+#define IR_STAR 0xF20DFF00
+#define IR_HASH 0xBA45FF00
+#define IR_UP   0xB946FF00
+#define IR_DOWN 0xEA15FF00
+
+// =====================================================
+//              ENIGMI PER DIFFICOLTA' (NO SPAZI)
+//              SOLUZIONI SENZA ZERO DAVANTI
+// =====================================================
+
+// EASY
+Puzzle easyPool[] = {
+  {"(3+5)*2",   "16"},
+  {"10+7-4",    "13"},
+  {"(12/3)+6",  "10"},
+  {"9*2",       "18"},
+  {"20-3*4",    "8"}     // <-- niente 08
+};
+const int EASY_N = sizeof(easyPool)/sizeof(easyPool[0]);
+
+// NORMAL
+Puzzle normalPool[] = {
+  {"(7+5)*3",       "36"},
+  {"(18/3)+(4*2)",  "14"},
+  {"(9*3)-5",       "22"},
+  {"(32/4)+7",      "15"},
+  {"(6*6)-(8/2)",   "32"},
+  {"(25-9)+(12/3)", "20"}
+};
+const int NORMAL_N = sizeof(normalPool)/sizeof(normalPool[0]);
+
+// HARD
+Puzzle hardPool[] = {
+  {"(8*6)-(12/3)",  "44"},
+  {"(9*7)-(20/4)",  "58"},
+  {"(50/2)+(7*3)",  "46"},
+  {"(11*5)-(18/3)", "49"},
+  {"6*(9-2)",       "42"},
+  {"(72/6)*3-1",    "35"}
+};
+const int HARD_N = sizeof(hardPool)/sizeof(hardPool[0]);
+
+Puzzle p1, p2;
+
+// =====================================================
+//               MYSTERY BUTTONS
+// =====================================================
+int mysteryBonusIndex = 0;
+bool mysteryUsed = false;
+const int BONUS_SECONDS   = 10;
+const int PENALTY_SECONDS = 5;
+
+// =====================================================
+//                   FUNZIONI UTILI
+// =====================================================
+char decodeDigit(unsigned long code) {
+  switch(code) {
+    case IR_0: return '0';
+    case IR_1: return '1';
+    case IR_2: return '2';
+    case IR_3: return '3';
+    case IR_4: return '4';
+    case IR_5: return '5';
+    case IR_6: return '6';
+    case IR_7: return '7';
+    case IR_8: return '8';
+    case IR_9: return '9';
+    default: return '\0';
+  }
+}
+
+// beep breve per tick
+void beepTick() {
+  digitalWrite(buzzerPin, HIGH);
+  delay(15);
+  digitalWrite(buzzerPin, LOW);
+}
+
+// beep più lungo per feedback/errori
+void beep(int ms=80) {
+  digitalWrite(buzzerPin, HIGH);
+  delay(ms);
+  digitalWrite(buzzerPin, LOW);
+}
+
+// beep-boop arming (attivo quindi solo ON/OFF)
+void beepBoopStartup() {
+  digitalWrite(buzzerPin, HIGH); delay(70);  digitalWrite(buzzerPin, LOW); delay(80);
+  digitalWrite(buzzerPin, HIGH); delay(110); digitalWrite(buzzerPin, LOW); delay(120);
+  digitalWrite(buzzerPin, HIGH); delay(60);  digitalWrite(buzzerPin, LOW); delay(70);
+  digitalWrite(buzzerPin, HIGH); delay(130); digitalWrite(buzzerPin, LOW); delay(150);
+}
+
+// =====================================================
+//                      UI / LCD
+// =====================================================
+const char* diffLabel() {
+  switch(difficulty) {
+    case EASY: return "EASY";
+    case NORMAL: return "NORMAL";
+    case HARD: return "HARD";
+    default: return "NORMAL";
+  }
+}
+
+void showIdleScreen() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Diff: ");
+  lcd.print(diffLabel());
+  lcd.setCursor(0,1);
+  lcd.print("Push Red Bottom");
+}
+
+void animateArming() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("ARMING");
+  lcd.setCursor(0,1);
+  lcd.print("[");
+  for(int i=0;i<14;i++){
+    lcd.setCursor(1+i,1);
+    lcd.print("#");
+    beepTick();
+    delay(70);
+  }
+  lcd.setCursor(15,1);
+  lcd.print("]");
+}
+
+// strobo + testo BOOOOM!!!
+void strobeBoom() {
+  for (int i=0; i<8; i++) {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("BOOOOM!!!");
+    beep(80);
+    delay(120);
+    lcd.clear();
+    delay(80);
+  }
+}
+
+void animateDisarm() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("DISARMING...");
+  for(int i=0;i<3;i++){
+    lcd.setCursor(0,1); lcd.print(".....        ");
+    beep(50); delay(150);
+    lcd.setCursor(0,1); lcd.print("..... ..     ");
+    beep(50); delay(150);
+    lcd.setCursor(0,1); lcd.print("..... ....   ");
+    beep(50); delay(150);
+  }
+}
+
+// Riga 0: enigma
+// Riga 1: R:__ T:xx
+void showPuzzleScreen(const Puzzle& p, int n) {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(p.expr);
+
+  lcd.setCursor(0,1);
+  lcd.print("R:__ T:");
+  lcd.setCursor(6,1);
+  lcd.print(timeLeft);
+
+  Serial.print("Mostro enigma "); Serial.print(n);
+  Serial.print(": "); Serial.println(p.expr);
+}
+
+void updateInputOnLCD() {
+  lcd.setCursor(2,1); // dopo "R:"
+  for(int i=0;i<maxInputLen;i++) {
+    if(i < inputCode.length()) lcd.print(inputCode[i]);
+    else lcd.print('_');
+  }
+}
+
+void updatePuzzleTimeOnLCD() {
+  lcd.setCursor(6,1);  // dopo "T:"
+  lcd.print("   ");
+  lcd.setCursor(6,1);
+  lcd.print(timeLeft);
+}
+
+// schermata fili con codice + timer
+void showWireScreen() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("CUT THE WIRE");
+
+  lcd.setCursor(0,1);
+  lcd.print("CODE:");
+  lcd.print(p2.solution);
+  lcd.print(" T:");
+  lcd.print(timeLeft);
+}
+
+// =====================================================
+//             SCELTA RANDOM ENIGMI / MYSTERY
+// =====================================================
+void chooseRandomPuzzles() {
+  int i1, i2;
+
+  if (difficulty == EASY) {
+    i1 = random(0, EASY_N);
+    do { i2 = random(0, EASY_N); } while(i2 == i1);
+    p1 = easyPool[i1];
+    p2 = easyPool[i2];
+  }
+  else if (difficulty == NORMAL) {
+    i1 = random(0, NORMAL_N);
+    do { i2 = random(0, NORMAL_N); } while(i2 == i1);
+    p1 = normalPool[i1];
+    p2 = normalPool[i2];
+  }
+  else {
+    i1 = random(0, HARD_N);
+    do { i2 = random(0, HARD_N); } while(i2 == i1);
+    p1 = hardPool[i1];
+    p2 = hardPool[i2];
+  }
+
+  Serial.println("=== NUOVA PARTITA ===");
+  Serial.print("Difficolta: "); Serial.println(diffLabel());
+  Serial.print("Enigma1: "); Serial.println(p1.expr);
+  Serial.print("Soluzione1: "); Serial.println(p1.solution);
+  Serial.print("Enigma2: "); Serial.println(p2.expr);
+  Serial.print("Soluzione2: "); Serial.println(p2.solution);
+}
+
+void chooseMysteryButtons() {
+  mysteryBonusIndex = random(0, 2);
+  mysteryUsed = false;
+
+  Serial.print("Mystery BONUS index = ");
+  Serial.println(mysteryBonusIndex);
+}
+
+// =====================================================
+//                  LOGICA DI GIOCO
+// =====================================================
+void applyDifficulty() {
+  switch(difficulty) {
+    case EASY:   timeLeft = 90; speedStep = 0.25; break;
+    case NORMAL: timeLeft = 60; speedStep = 0.4;  break;
+    case HARD:   timeLeft = 40; speedStep = 0.6;  break;
+  }
+}
+
+void loseGame(const char* reasonLine2) {
+  gameOver = true;
+  gameActive = false;
+
+  strobeBoom();
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("BOOOOM!!!");
+  lcd.setCursor(0,1);
+  lcd.print(reasonLine2);
+
+  for(int i=0;i<3;i++) digitalWrite(ledPins[i], LOW);
+
+  Serial.print("GAME OVER: ");
+  Serial.println(reasonLine2);
+
+  beep(700);
+}
+
+void winGame() {
+  gameOver = true;
+  gameActive = false;
+
+  animateDisarm();
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("BOMB DISARMED");
+  lcd.setCursor(0,1);
+  lcd.print("GOOD JOB!");
+
+  for(int i=0;i<3;i++) digitalWrite(ledPins[i], LOW);
+
+  Serial.println("GAME WIN!");
+
+  for(int i=0;i<3;i++){ beep(70); delay(90); }
+}
+
+void registerError() {
+  errors++;
+  beep(220);
+
+  if(errors <= 3) digitalWrite(ledPins[3 - errors], LOW);
+
+  speedFactor += speedStep;
+  inputCode = "";
+  updateInputOnLCD();
+
+  Serial.print("Errore! errori=");
+  Serial.print(errors);
+  Serial.print(" speedFactor=");
+  Serial.println(speedFactor);
+
+  if(errors >= 3) loseGame("TOO MANY ERRORS");
+}
+
+void resetGame() {
+  errors = 0;
+  inputCode = "";
+  speedFactor = 1.0;
+  gameActive = true;
+  gameOver = false;
+  phase = PHASE_PUZZLE1;
+
+  applyDifficulty();
+  chooseRandomPuzzles();
+  chooseMysteryButtons();
+
+  for(int i=0;i<3;i++) digitalWrite(ledPins[i], HIGH);
+
+  beepBoopStartup();
+  animateArming();
+
+  showPuzzleScreen(p1, 1);
+  lastTick = millis();
+}
+
+// =====================================================
+//             REGOLA FILO A: ULTIMA CIFRA
+// =====================================================
+int targetWireFromP2() {
+  int res2 = atoi(p2.solution);   // es. "8" -> 8, "14" -> 14
+  int lastDigit = res2 % 10;
+
+  if (lastDigit == 0 || lastDigit == 5) return 2; // VERDE
+  if (lastDigit % 2 == 0) return 1;               // pari -> BLU
+  return 0;                                       // dispari -> ROSSO
+}
+
+// =====================================================
+//          FASE 3: MYSTERY + FILI
+// =====================================================
+void checkMysteryButtons() {
+  if (phase != PHASE_WIRE || mysteryUsed) return;
+
+  for (int i = 0; i < 2; i++) {
+    if (digitalRead(mysteryPins[i]) == LOW) {
+      mysteryUsed = true;
+
+      if (i == mysteryBonusIndex) {
+        timeLeft += BONUS_SECONDS;
+        if (timeLeft > 999) timeLeft = 999;
+
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("BONUS FOUND!");
+        lcd.setCursor(0,1);
+        lcd.print("+10 SECONDS");
+        beep(120);
+        delay(900);
+        showWireScreen();
+
+        Serial.println("Mystery: BONUS +10s");
+      } else {
+        timeLeft -= PENALTY_SECONDS;
+        if (timeLeft < 0) timeLeft = 0;
+
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("TRAP DETECTED");
+        lcd.setCursor(0,1);
+        lcd.print("-5 SECONDS");
+        beep(200);
+        delay(900);
+        showWireScreen();
+
+        Serial.println("Mystery: TRAP -5s");
+      }
+      return;
+    }
+  }
+}
+
+void checkWires() {
+  if (phase != PHASE_WIRE) return;
+
+  int target = targetWireFromP2();
+
+  for (int b=0; b<3; b++) {
+    if (digitalRead(wirePins[b]) == LOW) {
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("CUT ");
+
+      if (b==0) lcd.print("RED");
+      if (b==1) lcd.print("BLUE");
+      if (b==2) lcd.print("GREEN");
+
+      Serial.print("Wire pressed=");
+      Serial.print(b);
+      Serial.print(" target=");
+      Serial.println(target);
+
+      if (b == target) winGame();
+      else loseGame("WRONG WIRE!");
+
+      delay(600);
+      return;
+    }
+  }
+}
+
+// =====================================================
+//                       SETUP
+// =====================================================
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));
+
+  lcd.begin(16,2);
+
+  for(int i=0;i<3;i++){
+    pinMode(ledPins[i], OUTPUT);
+    digitalWrite(ledPins[i], LOW);
+  }
+
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+
+  for(int i=0;i<3;i++){
+    pinMode(wirePins[i], INPUT_PULLUP);
+  }
+  for(int i=0;i<2;i++){
+    pinMode(mysteryPins[i], INPUT_PULLUP);
+  }
+
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+
+  showIdleScreen();
+}
+
+// =====================================================
+//                        LOOP
+// =====================================================
+void loop() {
+
+  // -------- IR INPUT --------
+  if(IrReceiver.decode()) {
+    unsigned long code = IrReceiver.decodedIRData.decodedRawData;
+
+    // RESET SECCO SEMPRE DISPONIBILE
+    if(code == IR_HASH) {
+      resetGame();
+      IrReceiver.resume();
+      return;
+    }
+
+    // IDLE: cambio difficoltà con frecce
+    if(!gameActive) {
+      if(code == IR_UP) {
+        if(difficulty < HARD) difficulty = (Difficulty)(difficulty + 1);
+        showIdleScreen();
+        beep(60);
+      }
+      if(code == IR_DOWN) {
+        if(difficulty > EASY) difficulty = (Difficulty)(difficulty - 1);
+        showIdleScreen();
+        beep(60);
+      }
+    }
+
+    // gioco attivo: enigmi
+    else if(gameActive && !gameOver && phase != PHASE_WIRE) {
+
+      if(code == IR_STAR) {
+        inputCode = "";
+        updateInputOnLCD();
+        beep(60);
+      }
+
+      else if(code == IR_OK) {
+        // accetta 1 o 2 cifre
+        if(inputCode.length() >= 1 && inputCode.length() <= maxInputLen) {
+          int inVal  = inputCode.toInt();
+          int solVal = (phase == PHASE_PUZZLE1) ? atoi(p1.solution) : atoi(p2.solution);
+
+          Serial.print("Input="); Serial.print(inVal);
+          Serial.print(" Expected="); Serial.println(solVal);
+
+          if(inVal == solVal) {
+            inputCode = "";
+
+            if (phase == PHASE_PUZZLE1) {
+              phase = PHASE_PUZZLE2;
+              showPuzzleScreen(p2, 2);
+            } else {
+              phase = PHASE_WIRE;
+
+              lcd.clear();
+              lcd.setCursor(0,0);
+              lcd.print("WIRE RULE:");
+              lcd.setCursor(0,1);
+              lcd.print("LAST DIGIT");
+              delay(1100);
+
+              showWireScreen();
+            }
+            beep(120);
+          } else {
+            registerError();
+          }
+        } else {
+          beep(120);
+        }
+      }
+
+      else {
+        char d = decodeDigit(code);
+        if(d != '\0' && inputCode.length() < maxInputLen) {
+          inputCode += d;
+          updateInputOnLCD();
+          beep(40);
+        }
+      }
+    }
+
+    IrReceiver.resume();
+  }
+
+  // -------- FASE FILI --------
+  if (gameActive && !gameOver && phase == PHASE_WIRE) {
+    checkMysteryButtons();
+    checkWires();
+  }
+
+  // -------- TIMER CONTINUO + BEEP SINGOLO --------
+  if(gameActive && !gameOver) {
+    unsigned long now = millis();
+    unsigned long interval = (unsigned long)(1000.0 / speedFactor);
+
+    if(now - lastTick >= interval) {
+      lastTick = now;
+      timeLeft--;
+
+      beepTick();
+
+      if (phase == PHASE_WIRE) {
+        // ristampo la riga per evitare problemi di allineamento
+        showWireScreen();
+      } else {
+        updatePuzzleTimeOnLCD();
+      }
+
+      if (timeLeft % 5 == 0) {
+        Serial.print("TimeLeft="); Serial.println(timeLeft);
+      }
+
+      if(timeLeft <= 0) loseGame("TIME UP!");
+    }
+  }
+}
